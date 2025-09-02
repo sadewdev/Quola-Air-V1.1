@@ -1,0 +1,351 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Quola AirDraw — Robust Hand-Tracked Air Drawing</title>
+  <style>
+    :root{
+      --bg:#0b1020; --panel:#0f1726; --muted:#9fb0d6; --text:#e8f0ff; --accent:#7c9cff;
+    }
+    html,body{height:100%; margin:0; background:var(--bg); color:var(--text); font-family:Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,'Noto Sans',sans-serif;}
+    .wrap{display:grid; grid-template-rows:auto 1fr auto; min-height:100vh; gap:12px; padding:14px;}
+    header{display:flex; gap:12px; align-items:center;}
+    header h1{font-size:18px;margin:0}
+    .stage{position:relative; width:100%; max-width:1200px; margin:0 auto; aspect-ratio:16/9; background:#000; border-radius:14px; overflow:hidden; box-shadow:0 14px 40px rgba(0,0,0,.6);}
+    video{position:absolute; inset:0; width:100%; height:100%; object-fit:cover; transform:scaleX(-1);} /* mirrored by default for natural view */
+    canvas{position:absolute; inset:0; width:100%; height:100%; pointer-events:none;}
+    .controls{position:absolute; left:12px; top:12px; display:flex; gap:8px; flex-wrap:wrap;}
+    .panel{background:rgba(8,12,20,.72); border:1px solid rgba(60,80,120,.12); padding:8px 10px; border-radius:10px; display:flex; gap:8px; align-items:center;}
+    .panel label{font-size:12px; color:var(--muted);}
+    .panel input[type="range"]{accent-color:var(--accent)}
+    .toolbar{position:absolute; right:12px; top:12px; display:flex; flex-direction:column; gap:8px;}
+    button{background:rgba(16,22,34,.78); color:var(--text); border:1px solid rgba(60,80,120,.14); padding:8px 10px; border-radius:10px; cursor:pointer;}
+    footer{display:flex; gap:12px; justify-content:center; color:var(--muted); font-size:13px;}
+    .status{font-size:13px; color:var(--muted); margin-left:auto}
+    .bad{color:#ff9b9b}
+    .good{color:#9bffcf}
+    .small{font-size:12px; color:var(--muted)}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>Quola AirDraw V1.1 — Robust Hand-Tracked Air Drawing</h1>
+      <div class="status" id="status">Initializing…</div>
+    </header>
+
+    <main style="display:grid; place-items:center;">
+      <div class="stage" id="stage">
+        <video id="video" playsinline autoplay></video>
+
+        <!-- drawing canvas (persistent strokes) -->
+        <canvas id="draw"></canvas>
+        <!-- overlay canvas (guides, debug) -->
+        <canvas id="overlay"></canvas>
+
+        <div class="controls">
+          <div class="panel">
+            <label>Color</label>
+            <input id="color" type="color" value="#7c9cff">
+            <label>Size</label>
+            <input id="size" type="range" min="2" max="40" value="8">
+            <label>Smooth</label>
+            <input id="smooth" type="range" min="0" max="0.9" step="0.01" value="0.35">
+          </div>
+
+          <div class="panel">
+            <input id="mirror" type="checkbox" checked />
+            <label for="mirror">Mirror view</label>
+            <input id="showGuides" type="checkbox" checked />
+            <label for="showGuides">Guides</label>
+          </div>
+        </div>
+
+        <div class="toolbar">
+          <button id="clearBtn">🧼 Clear</button>
+          <button id="undoBtn">↶ Undo</button>
+          <button id="saveBtn">💾 Save PNG</button>
+          <button id="eraserBtn">🧹 Eraser</button>
+        </div>
+      </div>
+    </main>
+
+    <footer>
+      <div class="small">Pinch (thumb + index) to draw — release to stop · Raise pinky to start a new stroke</div>
+      <div id="info" class="small" style="margin-left:auto"></div>
+    </footer>
+  </div>
+
+  <!-- Use MediaPipe Tasks (HandLandmarker) -->
+  <script type="module">
+  import { FilesetResolver, HandLandmarker } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0";
+
+  (async () => {
+    const statusEl = document.getElementById('status');
+    const infoEl = document.getElementById('info');
+    const video = document.getElementById('video');
+    const drawCanvas = document.getElementById('draw');
+    const overlayCanvas = document.getElementById('overlay');
+    const ctx = drawCanvas.getContext('2d');
+    const octx = overlayCanvas.getContext('2d');
+
+    const colorEl = document.getElementById('color');
+    const sizeEl = document.getElementById('size');
+    const smoothEl = document.getElementById('smooth');
+    const mirrorEl = document.getElementById('mirror');
+    const showGuidesEl = document.getElementById('showGuides');
+    const clearBtn = document.getElementById('clearBtn');
+    const undoBtn = document.getElementById('undoBtn');
+    const saveBtn = document.getElementById('saveBtn');
+    const eraserBtn = document.getElementById('eraserBtn');
+
+    let isEraser = false;
+    let strokes = []; // {points: [{x,y}], color, size, eraser}
+    let current = null;
+    let lastPt = null;
+    let pinkyWasUp = false;
+    let fps = {last: performance.now(), count: 0, value: 0};
+
+    function setStatus(txt, good = true){
+      statusEl.textContent = txt;
+      statusEl.className = good ? 'good' : 'bad';
+    }
+
+    function resizeCanvases(){
+      const rect = document.getElementById('stage').getBoundingClientRect();
+      [drawCanvas, overlayCanvas].forEach(c=>{
+        c.width = Math.max(2, Math.round(rect.width));
+        c.height = Math.max(2, Math.round(rect.height));
+      });
+    }
+    new ResizeObserver(resizeCanvases).observe(document.getElementById('stage'));
+
+    clearBtn.onclick = () => { strokes = []; ctx.clearRect(0,0,drawCanvas.width,drawCanvas.height); setStatus('Cleared', true); };
+    undoBtn.onclick = () => { strokes.pop(); redrawFromStrokes(); setStatus('Undo', true); };
+    saveBtn.onclick = () => {
+      try {
+        const merged = document.createElement('canvas');
+        merged.width = drawCanvas.width; merged.height = drawCanvas.height;
+        const mctx = merged.getContext('2d');
+        // draw mirrored view if mirror checkbox is checked (to match what user sees)
+        if (mirrorEl.checked) { mctx.translate(merged.width, 0); mctx.scale(-1,1); }
+        mctx.drawImage(video, 0, 0, merged.width, merged.height);
+        if (mirrorEl.checked) { mctx.setTransform(1,0,0,1,0,0); }
+        mctx.drawImage(drawCanvas, 0, 0);
+        const a = document.createElement('a');
+        a.download = 'airdraw.png';
+        a.href = merged.toDataURL('image/png');
+        a.click();
+        setStatus('Saved PNG', true);
+      } catch (e) {
+        console.error(e);
+        setStatus('Save failed', false);
+      }
+    };
+    eraserBtn.onclick = () => { isEraser = !isEraser; eraserBtn.style.opacity = isEraser ? '0.8' : '1'; setStatus(isEraser ? 'Eraser ON' : 'Eraser OFF', true); };
+
+    function redrawFromStrokes(){
+      ctx.clearRect(0,0,drawCanvas.width,drawCanvas.height);
+      for(const s of strokes){
+        ctx.save();
+        ctx.globalCompositeOperation = s.eraser ? 'destination-out' : 'source-over';
+        ctx.strokeStyle = s.color; ctx.lineWidth = s.size; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+        ctx.beginPath();
+        for(let i=0;i<s.points.length;i++){
+          const p = s.points[i];
+          if(i===0) ctx.moveTo(p.x,p.y); else ctx.lineTo(p.x,p.y);
+        }
+        ctx.stroke();
+        ctx.restore();
+      }
+    }
+
+    function pushPoint(pt){
+      if(!current){
+        current = {points:[], color: isEraser ? '#000000' : colorEl.value, size: parseFloat(sizeEl.value), eraser: isEraser};
+        strokes.push(current);
+      }
+      current.points.push(pt);
+      // incremental draw
+      const n = current.points.length;
+      if(n>1){
+        ctx.save();
+        ctx.globalCompositeOperation = current.eraser ? 'destination-out' : 'source-over';
+        ctx.strokeStyle = current.color; ctx.lineWidth = current.size; ctx.lineCap='round'; ctx.lineJoin='round';
+        ctx.beginPath();
+        const a = current.points[n-2], b = current.points[n-1];
+        ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
+        ctx.restore();
+      }
+    }
+    function endStroke(){ current = null; lastPt = null; }
+
+    // Start camera & model init
+    setStatus('Requesting camera…', true);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'user', width:1280, height:720}, audio:false});
+      video.srcObject = stream;
+    } catch (err) {
+      console.error('camera error', err);
+      setStatus('Camera denied or not found', false);
+      infoEl.textContent = 'Allow camera & reload the page.';
+      return;
+    }
+
+    // Wait for video metadata to know actual size
+    await new Promise(res => {
+      if (video.readyState >= 2) return res();
+      video.onloadedmetadata = () => res();
+    });
+    // initial resize
+    resizeCanvases();
+
+    setStatus('Loading HandLandmarker model…', true);
+    let handLandmarker = null;
+    try {
+      const wasmUrl = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm";
+      const fileset = await FilesetResolver.forVisionTasks(wasmUrl);
+      handLandmarker = await HandLandmarker.createFromOptions(fileset, {
+        baseOptions: {
+          modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
+        },
+        runningMode: "VIDEO",
+        numHands: 1,
+        minTrackingConfidence: 0.5,
+        minDetectionConfidence: 0.5
+      });
+      setStatus('Model loaded — ready', true);
+    } catch (err) {
+      console.error('model load error', err);
+      setStatus('Model failed to load', false);
+      infoEl.textContent = 'Check console for errors (CORS / network).';
+      return;
+    }
+
+    // Main detection loop
+    function mapToCanvas(p, W, H){
+      // p: normalized landmark {x,y} (0..1)
+      // Mirror coordinates to match visual video mirroring if mirror checkbox is checked
+      const x = (mirrorEl.checked ? (1 - p.x) : p.x) * W;
+      const y = p.y * H;
+      return { x, y };
+    }
+
+    function distancePx(a, b){
+      const dx = a.x - b.x, dy = a.y - b.y;
+      return Math.hypot(dx, dy);
+    }
+
+    async function frameLoop(){
+      try {
+        // Compute FPS
+        fps.count++;
+        const now = performance.now();
+        if (now - fps.last >= 500) {
+          fps.value = Math.round((fps.count * 1000) / (now - fps.last));
+          fps.last = now; fps.count = 0;
+        }
+        const W = overlayCanvas.width, H = overlayCanvas.height;
+        octx.clearRect(0,0,W,H);
+
+        // Detect
+        let results = null;
+        try {
+          results = handLandmarker.detectForVideo(video, performance.now());
+        } catch (e) {
+          // sometimes the task throws if input not ready — ignore gracefully
+          console.warn('detectForVideo error', e);
+        }
+
+        if (results && results.landmarks && results.landmarks.length > 0 && results.landmarks[0] && results.landmarks[0].length >= 21) {
+          const lm = results.landmarks[0];
+
+          // Points we use (normalized): index tip (8), thumb tip (4), index mcp/base (5), pinky tip (20), pinky mcp (17)
+          const idxTipN = lm[8], thbTipN = lm[4], idxBaseN = lm[5], pinkyTipN = lm[20], pinkyBaseN = lm[17];
+
+          const idxTip = mapToCanvas(idxTipN, W, H);
+          const thbTip = mapToCanvas(thbTipN, W, H);
+          const idxBase = mapToCanvas(idxBaseN, W, H);
+          const pinkyTip = mapToCanvas(pinkyTipN, W, H);
+          const pinkyBase = mapToCanvas(pinkyBaseN, W, H);
+
+          // Adaptive hand span (px) using distance between index base and pinky base
+          const handSpan = Math.max(8, distancePx(idxBase, pinkyBase));
+          const pinchDist = distancePx(idxTip, thbTip);
+          // Threshold as a fraction of handSpan
+          const pinchThreshold = Math.max(18, handSpan * 0.35);
+          const pinch = pinchDist < pinchThreshold;
+
+          // Pinky up detection -> start a fresh stroke boundary
+          const pinkyUp = pinkyTip.y < idxBase.y - handSpan * 0.12; // pinky tip significantly above index base
+          if (pinkyUp && !pinkyWasUp) { endStroke(); }
+          pinkyWasUp = pinkyUp;
+
+          // smoothing
+          const alpha = parseFloat(smoothEl.value) || 0.35;
+          const target = idxTip;
+          if (!lastPt) lastPt = { x: target.x, y: target.y };
+          else lastPt = { x: lastPt.x * (1 - alpha) + target.x * alpha, y: lastPt.y * (1 - alpha) + target.y * alpha };
+
+          if (pinch) {
+            pushPoint({ x: lastPt.x, y: lastPt.y });
+          } else {
+            endStroke();
+          }
+
+          // Guides
+          if (showGuidesEl.checked) {
+            octx.save();
+            octx.lineWidth = 2;
+            octx.strokeStyle = 'rgba(200,220,255,0.7)';
+            // pinch line
+            octx.beginPath(); octx.moveTo(idxTip.x, idxTip.y); octx.lineTo(thbTip.x, thbTip.y); octx.stroke();
+            // fingertip circle
+            octx.beginPath(); octx.arc(lastPt.x, lastPt.y, pinch ? 8 : 6, 0, Math.PI * 2); octx.fillStyle = pinch ? 'rgba(40,220,160,0.95)' : 'rgba(124,156,255,0.9)'; octx.fill();
+            // handSpan indicator
+            octx.beginPath(); octx.arc(idxBase.x, idxBase.y, Math.max(4, handSpan*0.06), 0, Math.PI*2); octx.fillStyle = 'rgba(255,255,255,0.04)'; octx.fill();
+            octx.restore();
+          }
+
+          infoEl.textContent = `FPS: ${fps.value} • pinchDist: ${Math.round(pinchDist)} px • thresh: ${Math.round(pinchThreshold)} px`;
+          setStatus('Tracking hand', true);
+        } else {
+          // no hand
+          endStroke();
+          infoEl.textContent = `FPS: ${fps.value} • no hand`;
+          setStatus('No hand detected', false);
+        }
+      } catch (err) {
+        console.error('loop error', err);
+        setStatus('Runtime error (see console)', false);
+      } finally {
+        requestAnimationFrame(frameLoop);
+      }
+    }
+
+    // Start the loop once video is playing nicely
+    if (video.readyState >= 2) {
+      requestAnimationFrame(frameLoop);
+    } else {
+      video.onplay = () => requestAnimationFrame(frameLoop);
+    }
+
+    // helpful keyboard shortcuts
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'c') { strokes = []; ctx.clearRect(0,0,drawCanvas.width,drawCanvas.height); setStatus('Cleared', true); }
+      if (e.key === 'z') { strokes.pop(); redrawFromStrokes(); setStatus('Undo', true); }
+    });
+
+    // Resize handling: ensure canvases match video visual size often (handles layout changes)
+    setInterval(() => {
+      resizeCanvases();
+      redrawFromStrokes();
+    }, 300);
+
+    // final friendly hint
+    setStatus('Ready — pinch to draw. If detection is poor, increase lighting or move your hand closer.', true);
+  })();
+  </script>
+</body>
+</html>
